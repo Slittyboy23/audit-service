@@ -87,6 +87,66 @@ async def get_audit_status(audit_id: str) -> AuditStatusResponse:
     return job
 
 
+@app.post("/v1/preview")
+async def preview_file(
+    kind: str = Form(...),                 # 'rent_roll' | 'vehicles' | 'myvip'
+    filename: str = Form(...),
+    file: UploadFile = File(...),
+    column_mappings: Optional[str] = Form(None),
+    claims: IncomingClaims = Depends(verify_dispatch_token),
+) -> dict:
+    """Parse a single file and return summary counts for the wizard preview UI.
+
+    Synchronous (blocks for parse duration; ~1-3s for typical files). No workbook
+    generation, no callback. The same per-audit JWT auth/encryption applies.
+
+    Response shape varies by kind:
+      rent_roll → { total_units, occupied_units, vacant_units, model_units,
+                    ntv_units, future_residents }
+      vehicles  → { total_vehicles, total_units }
+      myvip     → { total_units }
+    """
+    if kind not in {"rent_roll", "vehicles", "myvip"}:
+        raise HTTPException(status_code=400, detail=f"unknown_preview_kind: {kind}")
+
+    raw = await file.read()
+    try:
+        plain = decrypt(raw, claims.file_key)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"decryption_failed: {exc}")
+
+    from .parsers import parse_rent_roll, parse_vehicle_data
+    from collections import Counter
+
+    try:
+        if kind == "rent_roll":
+            entries = parse_rent_roll(plain, filename)
+            primary = {}
+            future = 0
+            for e in entries:
+                if e.is_future:
+                    future += 1
+                else:
+                    primary[e.apt] = e
+            counts = Counter(e.status for e in primary.values())
+            return {
+                "total_units": len(primary),
+                "occupied_units": counts.get("occupied", 0),
+                "vacant_units": counts.get("vacant", 0),
+                "model_units": counts.get("model", 0),
+                "ntv_units": counts.get("ntv", 0),
+                "future_residents": future,
+            }
+        else:
+            vehicles = parse_vehicle_data(plain, filename)
+            return {
+                "total_vehicles": len(vehicles),
+                "total_units": len({v.apt for v in vehicles}),
+            }
+    except AuditEngineError as e:
+        raise HTTPException(status_code=400, detail={"code": e.code, "message": e.message})
+
+
 @app.post("/v1/audits", status_code=202, response_model=AcceptedResponse)
 async def submit_audit(
     background: BackgroundTasks,
