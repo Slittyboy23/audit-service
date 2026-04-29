@@ -1,17 +1,8 @@
-"""Audit engine — port target for the `permit-audit` skill.
+"""Audit engine — orchestrates parsing, cross-reference, and workbook generation.
 
-STATUS: STUB. The real port from the permit-audit skill (pdfplumber rent-roll
-parsing, vehicle-data normalization, name-matching, openpyxl workbook gen)
-lands in a follow-up commit.
-
-Contract: this module is called from app.main with the decrypted file bytes
-plus the property metadata, and must return:
-  - workbook_bytes: the unencrypted .xlsx as bytes
-  - metrics: dict matching app.models.AuditMetrics
-
-If parsing fails, raise AuditEngineError with a machine-readable code +
-human-readable message. Per contract §11, v1 is all-or-nothing — partial
-results are explicitly out of scope.
+Faithful port of the `permit-audit` skill (SKILL.md). Errors raised as
+AuditEngineError flow through to dispatch as `error_code` + `error_message`
+(contract §4.2).
 """
 from __future__ import annotations
 
@@ -50,10 +41,49 @@ class AuditOutput:
 def run_audit(inputs: AuditInputs) -> AuditOutput:
     """Run the parking compliance audit end-to-end.
 
-    TODO: port from permit-audit skill. For now, this raises so the service
-    never silently returns empty results in prod.
+    1. Parse rent roll (PDF or XLSX).
+    2. Parse vehicle/permit data (CSV or XLSX).
+    3. Cross-reference (compliance, tow risk, name discrepancies).
+    4. Generate the 5-sheet workbook.
+    5. Return metrics matching contract §7.
     """
-    raise AuditEngineError(
-        code="not_implemented",
-        message="Audit engine port from permit-audit skill is pending.",
+    # Imports are deferred to keep this module light at startup
+    from .cross_reference import cross_reference
+    from .parsers import parse_rent_roll, parse_vehicle_data
+    from .workbook import build_workbook
+
+    rent_roll = parse_rent_roll(inputs.rent_roll, inputs.rent_roll_filename)
+    vehicles = parse_vehicle_data(inputs.vehicle_data, inputs.vehicle_data_filename)
+
+    audit = cross_reference(
+        property_name=inputs.property_name,
+        rent_roll=rent_roll,
+        vehicles=vehicles,
+        rent_roll_date=None,  # could be extracted from PDF first page later
     )
+
+    workbook_bytes = build_workbook(audit)
+
+    # Detect vehicle data source from filename — feeds Sheet 1 subtitle and metrics
+    src = inputs.vehicle_data_filename or ""
+    if "permitclick" in src.lower():
+        vehicle_source = "PermitClick"
+    elif "myvip" in src.lower() or "profile" in src.lower():
+        vehicle_source = "MyVIP"
+    else:
+        vehicle_source = "Parking System"
+
+    metrics = {
+        "total_units": audit.rent_roll_units,
+        "occupied_units": audit.occupied,
+        "vacant_units": audit.vacant,
+        "model_units": audit.model,
+        "ntv_units": audit.ntv,
+        "compliance_rate": round(audit.compliance_rate, 4),
+        "tow_risk_units": audit.tow_risk,
+        "total_vehicles": audit.total_vehicles,
+        "name_discrepancies": len(audit.discrepancies),
+        "rent_roll_date": audit.rent_roll_date,
+        "vehicle_data_source": vehicle_source,
+    }
+    return AuditOutput(workbook_bytes=workbook_bytes, metrics=metrics)
