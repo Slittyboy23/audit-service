@@ -65,6 +65,21 @@ class AuditData:
     compliance_rate: float = 0.0
     tow_risk: int = 0
     total_vehicles: int = 0
+    # ─── Cover-sheet enrichment from wizard Step 1 (optional) ───
+    property_address: str = ""
+    audit_date: Optional[str] = None         # ISO yyyy-mm-dd, falls back to today
+    parking_program: Optional[str] = None    # 'myvip' | 'permit'
+    num_units_form: int = 0                  # what the user typed in Step 1
+    parking_lot: dict = field(default_factory=dict)  # reserved/open/guest/handicap/specialty/total
+    specialty_tags: List[str] = field(default_factory=list)
+    # Distribution of registered vehicles across occupied units (and overall).
+    # Keyed by bucket label: '0', '1', '2', '3', '4', '5', '6+'.
+    vehicle_distribution: dict = field(default_factory=dict)
+    # MyVIP profile coverage — only meaningful when parking_program == 'myvip'.
+    # Pulled from form_data.myvip_summary.myvip_profile_units. The cover renders
+    # `Units Without MyVIP Profile = occupied - myvip_profile_units` as a TOW
+    # RISK callout.
+    myvip_profile_units: int = 0
 
 
 _OCCUPANCY_LABEL = {
@@ -90,6 +105,7 @@ def cross_reference(
     rent_roll: List[RentRollEntry],
     vehicles: List[Vehicle],
     rent_roll_date: Optional[str] = None,
+    form_data: Optional[dict] = None,
 ) -> AuditData:
     """Produce the AuditData model that drives the 5-sheet workbook."""
 
@@ -228,6 +244,68 @@ def cross_reference(
         1 for apt, e in primary.items()
         if e.status == "occupied" and not by_apt.get(apt)
     )
+
+    # ----- Vehicle distribution buckets (cover-sheet histogram) -----------
+    # Bucket every OCCUPIED unit by how many vehicles it has registered.
+    # 0..5 are exact; 6+ is the overflow bucket. Always emit all keys so the
+    # cover sheet can render a complete histogram.
+    buckets = {"0": 0, "1": 0, "2": 0, "3": 0, "4": 0, "5": 0, "6+": 0}
+    for apt, e in primary.items():
+        if e.status != "occupied":
+            continue
+        n = len(by_apt.get(apt, []))
+        key = str(n) if n <= 5 else "6+"
+        buckets[key] += 1
+    data.vehicle_distribution = buckets
+
+    # ----- Optional form-data enrichment (cover sheet) --------------------
+    if form_data:
+        addr = form_data.get("property_address") or ""
+        data.property_address = addr.strip()
+
+        ad = form_data.get("audit_date")
+        data.audit_date = ad if isinstance(ad, str) and ad else None
+
+        pp = form_data.get("parking_program")
+        if pp in ("myvip", "permit"):
+            data.parking_program = pp
+
+        try:
+            data.num_units_form = int(form_data.get("units") or 0)
+        except (TypeError, ValueError):
+            data.num_units_form = 0
+
+        # Parking lot space breakdown — every key independent
+        def _int(k):
+            try:
+                return int(form_data.get(k) or 0)
+            except (TypeError, ValueError):
+                return 0
+        reserved = _int("reserved")
+        open_spc = _int("open_spaces")
+        guest = _int("guest")
+        handicap = _int("handicap")
+        specialty = _int("specialty")
+        data.parking_lot = {
+            "reserved": reserved,
+            "open": open_spc,
+            "guest": guest,
+            "handicap": handicap,
+            "specialty": specialty,
+            "total": reserved + open_spc + guest + handicap + specialty,
+        }
+
+        tags = form_data.get("specialty_tags")
+        if isinstance(tags, list):
+            data.specialty_tags = [str(t) for t in tags if t]
+
+        # MyVIP profile coverage (Step 4 wizard panel feeds this)
+        mv = form_data.get("myvip_summary") or {}
+        try:
+            data.myvip_profile_units = int(mv.get("myvip_profile_units") or 0)
+        except (TypeError, ValueError):
+            data.myvip_profile_units = 0
+
     return data
 
 

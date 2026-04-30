@@ -30,6 +30,11 @@ class AuditInputs:
     myvip_data: Optional[bytes] = None
     myvip_data_filename: Optional[str] = None
     column_mappings: Optional[dict] = None
+    # Wizard Step 1 form payload — property address, parking program,
+    # parking-lot space breakdown, specialty tags. Used for the marketing
+    # cover sheet (Sheet 1). Optional — when absent the cover falls back
+    # to whatever it can compute from the rent roll + vehicles alone.
+    form_data: Optional[dict] = None
 
 
 @dataclass
@@ -60,6 +65,7 @@ def run_audit(inputs: AuditInputs) -> AuditOutput:
         rent_roll=rent_roll,
         vehicles=vehicles,
         rent_roll_date=None,  # could be extracted from PDF first page later
+        form_data=inputs.form_data,
     )
 
     workbook_bytes = build_workbook(audit)

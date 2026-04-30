@@ -162,6 +162,7 @@ async def submit_audit(
     myvip_data: Optional[UploadFile] = File(None),
     myvip_data_filename: Optional[str] = Form(None),
     column_mappings: Optional[str] = Form(None),
+    form_data: Optional[str] = Form(None),
     claims: IncomingClaims = Depends(verify_dispatch_token),
 ) -> AcceptedResponse:
     """Accept a job, return 202 immediately, process in background."""
@@ -209,6 +210,7 @@ async def submit_audit(
         myvip_bytes=myvip_bytes,
         myvip_filename=myvip_data_filename,
         column_mappings_raw=column_mappings,
+        form_data_raw=form_data,
     )
 
     return AcceptedResponse(audit_id=audit_id, accepted_at=accepted_at)
@@ -231,6 +233,7 @@ async def _process_audit(
     myvip_bytes: Optional[bytes],
     myvip_filename: Optional[str],
     column_mappings_raw: Optional[str],
+    form_data_raw: Optional[str] = None,
 ) -> None:
     """Run the audit engine, encrypt the result, POST it back to dispatch."""
     global _active_count
@@ -250,9 +253,9 @@ async def _process_audit(
         vehicle_plain = decrypt(vehicle_data_bytes, file_key)
         myvip_plain = decrypt(myvip_bytes, file_key) if myvip_bytes else None
 
+        import json
         column_mappings = None
         if column_mappings_raw:
-            import json
             try:
                 column_mappings = json.loads(column_mappings_raw)
             except json.JSONDecodeError:
@@ -260,6 +263,15 @@ async def _process_audit(
                     code="validation_failed",
                     message="column_mappings is not valid JSON",
                 )
+        form_data = None
+        if form_data_raw:
+            try:
+                form_data = json.loads(form_data_raw)
+            except json.JSONDecodeError:
+                # form_data is best-effort enrichment for the cover sheet —
+                # don't fail the whole audit if it's malformed
+                log.warning("[%s] form_data is not valid JSON; ignoring", audit_id)
+                form_data = None
 
         inputs = AuditInputs(
             property_name=property_name,
@@ -271,6 +283,7 @@ async def _process_audit(
             myvip_data=myvip_plain,
             myvip_data_filename=myvip_filename,
             column_mappings=column_mappings,
+            form_data=form_data,
         )
 
         # 2) Run the audit (with hard timeout per contract §4.1)
