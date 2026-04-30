@@ -300,9 +300,13 @@ def _build_cover(wb: Workbook, audit: AuditData) -> None:
     total_spaces = pl.get("total", 0)
     reserved_spaces = pl.get("reserved", 0)
     is_myvip = audit.parking_program == "myvip"
-    units_without_myvip = (
-        max(audit.occupied - audit.myvip_profile_units, 0) if is_myvip else None
-    )
+    # TOW RISK = occupied units with zero vehicles registered. The cross-
+    # reference already computes this as audit.tow_risk. Earlier version
+    # subtracted audit.myvip_profile_units from audit.occupied — when the
+    # MyVIP step wasn't filled in (myvip_profile_units = 0) that produced
+    # a TOW RISK count equal to ALL occupied units (Matt saw 248 vs. the
+    # real 15). Always trust the cross-ref count.
+    tow_risk_count = audit.tow_risk if is_myvip else None
 
     # Color rules per spec: red = "something is wrong", yellow = warning at 90%+
     def _capacity_color(actual: int, capacity: int) -> str:
@@ -331,11 +335,11 @@ def _build_cover(wb: Workbook, audit: AuditData) -> None:
             "—",  # placeholder — needs reserved-spot tracking on the vehicle side
             "595959",
         ))
-    if units_without_myvip is not None:
+    if tow_risk_count is not None:
         findings_rows.append((
             "Units Without MyVIP Profile (TOW RISK)",
-            units_without_myvip,
-            RED_DEEP if units_without_myvip > 0 else "0F172A",
+            tow_risk_count,
+            RED_DEEP if tow_risk_count > 0 else "0F172A",
         ))
 
     af_start = af_band + 1
@@ -353,12 +357,13 @@ def _build_cover(wb: Workbook, audit: AuditData) -> None:
 
     findings_end = af_start + len(findings_rows) - 1
 
-    # Vehicle Distribution sub-block (counts AND % of occupied units)
+    # ── Vehicle Distribution data table (tight, two rows) ─────────────
+    # Title row
     vd_label_row = findings_end + 2
-    ws.row_dimensions[vd_label_row].height = 16
+    ws.row_dimensions[vd_label_row].height = 18
     ws.merge_cells(start_row=vd_label_row, start_column=2, end_row=vd_label_row, end_column=7)
-    vd_label = ws.cell(row=vd_label_row, column=2, value="Vehicle Distribution (per occupied unit)")
-    vd_label.font = Font(name=ARIAL, size=10, bold=True, color=BRAND_BLUE)
+    vd_label = ws.cell(row=vd_label_row, column=2, value="Vehicle Distribution per Occupied Unit")
+    vd_label.font = Font(name=ARIAL, size=11, bold=True, color=BRAND_BLUE)
     vd_label.alignment = Alignment(horizontal="left", vertical="center")
 
     distribution = audit.vehicle_distribution or {
@@ -368,48 +373,51 @@ def _build_cover(wb: Workbook, audit: AuditData) -> None:
     bucket_keys = ["0", "1", "2", "3", "4", "5", "6+"]
     counts = [distribution.get(k, 0) for k in bucket_keys]
 
-    # Header row of the distribution table
+    # Bucket header row — just the labels, centered, no row label
     vd_header_row = vd_label_row + 1
-    ws.row_dimensions[vd_header_row].height = 18
-    ws.cell(row=vd_header_row, column=2, value="Vehicles").font = Font(
-        name=ARIAL, size=9, bold=True, color="595959",
-    )
+    ws.row_dimensions[vd_header_row].height = 22
     for i, k in enumerate(bucket_keys):
-        c = 3 + i
+        c = 2 + i  # span B..H (7 columns for 7 buckets)
         h = ws.cell(row=vd_header_row, column=c, value=k)
-        h.font = Font(name=ARIAL, size=10, bold=True, color="595959")
+        h.font = Font(name=ARIAL, size=11, bold=True, color="FFFFFF")
+        h.fill = _fill(BRAND_BLUE)
         h.alignment = Alignment(horizontal="center", vertical="center")
+        h.border = DATA_BORDER
 
     # Counts row
     vd_count_row = vd_header_row + 1
-    ws.row_dimensions[vd_count_row].height = 20
-    ws.cell(row=vd_count_row, column=2, value="Units").font = Font(
-        name=ARIAL, size=9, color="595959",
-    )
+    ws.row_dimensions[vd_count_row].height = 24
     for i, n in enumerate(counts):
-        c = 3 + i
+        c = 2 + i
         cell = ws.cell(row=vd_count_row, column=c, value=n)
-        cell.font = Font(name=ARIAL, size=11, bold=True, color="0F172A")
+        cell.font = Font(name=ARIAL, size=14, bold=True, color="0F172A")
         cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = DATA_BORDER
 
     # Percent row
     vd_pct_row = vd_count_row + 1
     ws.row_dimensions[vd_pct_row].height = 18
-    ws.cell(row=vd_pct_row, column=2, value="% Occupied").font = Font(
-        name=ARIAL, size=9, color="595959",
-    )
     for i, n in enumerate(counts):
-        c = 3 + i
+        c = 2 + i
         pct = (n / occupied_total) * 100 if audit.occupied else 0
         cell = ws.cell(row=vd_pct_row, column=c, value=f"{pct:.1f}%")
         cell.font = Font(name=ARIAL, size=10, color="595959")
         cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = DATA_BORDER
 
-    # ── 5) Histogram (native Excel bar chart, brand-blue bars) ──────────
-    chart_data_row = vd_pct_row + 2
-    # Stash the bucket data in hidden cells so the chart can reference them.
-    # Place them well below the cover content so they don't affect layout.
-    data_anchor = chart_data_row + 30  # off the printed page, but still on sheet
+    # Tiny axis-label hint under the table
+    vd_hint_row = vd_pct_row + 1
+    ws.row_dimensions[vd_hint_row].height = 14
+    ws.merge_cells(start_row=vd_hint_row, start_column=2, end_row=vd_hint_row, end_column=7)
+    hint = ws.cell(row=vd_hint_row, column=2, value="Number of registered vehicles per occupied unit")
+    hint.font = Font(name=ARIAL, size=9, italic=True, color="808080")
+    hint.alignment = Alignment(horizontal="center", vertical="center")
+
+    # ── Histogram (native Excel bar chart) ───────────────────────────
+    chart_data_row = vd_hint_row + 2
+    # Stash the chart's source data well below the printable area so it
+    # doesn't show up next to the cover content.
+    data_anchor = chart_data_row + 40
     ws.cell(row=data_anchor, column=1, value="VehiclesPerUnit")
     ws.cell(row=data_anchor, column=2, value="Units")
     for i, k in enumerate(bucket_keys):
@@ -419,12 +427,14 @@ def _build_cover(wb: Workbook, audit: AuditData) -> None:
     chart = BarChart()
     chart.type = "col"
     chart.style = 2
-    chart.title = "Vehicles per Occupied Unit"
+    chart.title = None  # the table above already labels everything
     chart.y_axis.title = "Number of Units"
-    chart.x_axis.title = "Vehicles registered"
+    chart.x_axis.title = None
     chart.legend = None
-    chart.height = 8
-    chart.width = 16
+    chart.height = 9
+    chart.width = 18
+    # Tighter bar gap → wider, more readable bars
+    chart.gapWidth = 80
     cats = Reference(
         ws, min_col=1, min_row=data_anchor + 1,
         max_row=data_anchor + len(bucket_keys),
@@ -435,16 +445,27 @@ def _build_cover(wb: Workbook, audit: AuditData) -> None:
     )
     chart.add_data(vals, titles_from_data=True)
     chart.set_categories(cats)
-    # Brand-blue bars + neutral-gray data labels
+    # Brand-blue bars
     for s in chart.series:
         s.graphicalProperties = GraphicalProperties(solidFill=BRAND_BLUE)
         s.graphicalProperties.line = LineProperties(solidFill=BRAND_BLUE_DARK)
-    chart.dataLabels = DataLabelList(showVal=True)
+    # Data labels: ONLY the count value, positioned ABOVE each bar.
+    # Without this, Excel renders "<series>, <category>, <value>" — Matt saw
+    # "Units, 0, 15" stacked on top of the bars.
+    chart.dataLabels = DataLabelList(
+        showVal=True,
+        showSerName=False,
+        showCatName=False,
+        showLegendKey=False,
+        showPercent=False,
+        showBubbleSize=False,
+        dLblPos="outEnd",
+    )
     chart_anchor = f"B{chart_data_row}"
     ws.add_chart(chart, chart_anchor)
 
-    # Print area covers the cover content (rows 2 → just past the chart).
-    chart_end_row = chart_data_row + 18
+    # Print area covers the cover content (rows 1 → just past the chart).
+    chart_end_row = chart_data_row + 20
     ws.print_area = f"A1:H{chart_end_row}"
 
 
