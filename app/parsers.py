@@ -217,17 +217,25 @@ def _parse_rent_roll_words(page, seen_units: set) -> List[RentRollEntry]:
         start_idx = anchor_idx + 1 if anchor_idx >= 0 else 2
         name_parts: List[str] = []
         for tok in tokens[start_idx:]:
-            if _NON_NAME_RE.match(tok):
-                break
             up = tok.upper()
             if up in {"VACANT", "MODEL"}:
                 # second VACANT marker or status hint — keep capturing one more iteration to be safe
                 if not name_parts:
                     name_parts.append(tok)
                 break
-            # Plates and unit-type codes are alphanumeric like '62842b2' — skip those mixed tokens
+            # Pure-numeric tokens (sqft, rent, deposit) — when we haven't
+            # started collecting a name yet, this is almost certainly the
+            # SqFt column wedged between unit-type and resident in Yardi
+            # exports. Skip it and keep looking for the actual name. Once
+            # we've started capturing, a numeric token marks end-of-name.
+            if _NON_NAME_RE.match(tok):
+                if not name_parts:
+                    continue
+                break
+            # Mixed alphanumeric (plates, unit-type codes like '62842b2',
+            # parenthetical amounts like 'Rodriguez(60),C'). Same rule —
+            # skip while we have no name yet, otherwise treat as end-of-name.
             if any(c.isdigit() for c in tok):
-                # If we have no name parts yet, this is probably the unit-type code; skip
                 if not name_parts:
                     continue
                 break
@@ -250,13 +258,56 @@ def _parse_rent_roll_words(page, seen_units: set) -> List[RentRollEntry]:
 # ------------------------------------------------------------------
 # Rent roll — Excel
 # ------------------------------------------------------------------
-def parse_rent_roll_xlsx(blob: bytes) -> List[RentRollEntry]:
-    from openpyxl import load_workbook
+def _load_workbook_rows(blob: bytes, filename: str) -> List[List]:
+    """Load worksheet rows from .xlsx (openpyxl) or legacy .xls (xlrd).
 
+    Centralized so both rent-roll and vehicle workbook parsers handle the
+    legacy binary BIFF format too. Many property managers still export
+    .xls because their PMS pre-dates the 2007 transition. Without this,
+    those uploads fail with a confusing "File is not a zip file" error.
+    """
+    name = (filename or "").lower()
+    if name.endswith(".xls"):
+        try:
+            import xlrd  # type: ignore
+        except ImportError as exc:
+            raise AuditEngineError(
+                code="parse_failed_rent_roll",
+                message=("Legacy .xls support requires the xlrd package. "
+                         "Re-save the file as .xlsx in Excel and re-upload."),
+            ) from exc
+        try:
+            book = xlrd.open_workbook(file_contents=blob)
+            sheet = book.sheet_by_index(0)
+            rows: List[List] = []
+            for r in range(sheet.nrows):
+                rows.append([sheet.cell_value(r, c) for c in range(sheet.ncols)])
+            return rows
+        except AuditEngineError:
+            raise
+        except Exception as exc:
+            raise AuditEngineError(
+                code="parse_failed_rent_roll",
+                message=f"Failed to open legacy .xls workbook: {exc}",
+            )
+    # Default: openpyxl path for .xlsx / .xlsm
+    from openpyxl import load_workbook
     try:
         wb = load_workbook(io.BytesIO(blob), data_only=True, read_only=True)
         ws = wb.active
-        rows = [[c if c is not None else "" for c in row] for row in ws.iter_rows(values_only=True)]
+        return [[c if c is not None else "" for c in row] for row in ws.iter_rows(values_only=True)]
+    except Exception as exc:
+        raise AuditEngineError(
+            code="parse_failed_rent_roll",
+            message=f"Failed to open rent roll workbook: {exc}",
+        )
+
+
+def parse_rent_roll_xlsx(blob: bytes, filename: str = "") -> List[RentRollEntry]:
+    try:
+        rows = _load_workbook_rows(blob, filename)
+    except AuditEngineError:
+        raise
     except Exception as exc:
         raise AuditEngineError(
             code="parse_failed_rent_roll",
@@ -269,6 +320,31 @@ def parse_rent_roll_xlsx(blob: bytes) -> List[RentRollEntry]:
             code="parse_failed_rent_roll",
             message="Could not find Unit/Name header row in rent roll.",
         )
+
+    # Column-shift fallback: some Yardi exports (especially legacy .xls
+    # round-trips) have merged-cell headers where the visible label sits
+    # in a different column than the actual data. We sanity-check the
+    # detected unit column against the next 20 data rows. If most rows
+    # have something in unit_idx-1 but nothing in unit_idx, shift left.
+    def _shift_if_misaligned(role: str, max_shift: int = 2) -> None:
+        idx = cols.get(role)
+        if idx is None or idx == 0:
+            return
+        sample = rows[header_idx + 1: header_idx + 21]
+        def col_filled(rs, ci):
+            return sum(1 for r in rs if ci < len(r) and str(r[ci]).strip())
+        here = col_filled(sample, idx)
+        for shift in range(1, max_shift + 1):
+            new_idx = idx - shift
+            if new_idx < 0:
+                break
+            there = col_filled(sample, new_idx)
+            # Require the alternative column to be substantially better-filled
+            if there >= max(3, here * 2 + 1):
+                cols[role] = new_idx
+                return
+    _shift_if_misaligned("unit")
+    _shift_if_misaligned("name")
 
     entries: List[RentRollEntry] = []
     seen: set = set()
@@ -362,13 +438,16 @@ def parse_vehicle_csv(blob: bytes) -> List[Vehicle]:
         )
 
 
-def parse_vehicle_xlsx(blob: bytes) -> List[Vehicle]:
-    from openpyxl import load_workbook
-
+def parse_vehicle_xlsx(blob: bytes, filename: str = "") -> List[Vehicle]:
     try:
-        wb = load_workbook(io.BytesIO(blob), data_only=True, read_only=True)
-        ws = wb.active
-        rows = list(ws.iter_rows(values_only=True))
+        rows = _load_workbook_rows(blob, filename)
+    except AuditEngineError as exc:
+        # Re-tag the error code from rent_roll → vehicle_data so the UI shows
+        # the right context to the user, but keep the message text intact.
+        raise AuditEngineError(
+            code="parse_failed_vehicle_data",
+            message=exc.message,
+        )
     except Exception as exc:
         raise AuditEngineError(
             code="parse_failed_vehicle_data",
@@ -426,7 +505,7 @@ def parse_rent_roll(blob: bytes, filename: str) -> List[RentRollEntry]:
     if name.endswith(".pdf"):
         return parse_rent_roll_pdf(blob)
     if name.endswith(".xlsx") or name.endswith(".xlsm") or name.endswith(".xls"):
-        return parse_rent_roll_xlsx(blob)
+        return parse_rent_roll_xlsx(blob, filename)
     raise AuditEngineError(
         code="validation_failed",
         message=f"Unsupported rent roll file type: {filename}",
@@ -438,7 +517,7 @@ def parse_vehicle_data(blob: bytes, filename: str) -> List[Vehicle]:
     if name.endswith(".csv") or name.endswith(".txt"):
         return parse_vehicle_csv(blob)
     if name.endswith(".xlsx") or name.endswith(".xlsm") or name.endswith(".xls"):
-        return parse_vehicle_xlsx(blob)
+        return parse_vehicle_xlsx(blob, filename)
     raise AuditEngineError(
         code="validation_failed",
         message=f"Unsupported vehicle data file type: {filename}",
