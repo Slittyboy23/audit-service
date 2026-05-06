@@ -29,6 +29,13 @@ _APT_PATTERNS = [
     re.compile(r"^(\d+)$"),                 # "0111"      → 111 (after lstrip)
 ]
 
+# Building-and-unit composite IDs (e.g. DayRise PMS exports: "400-1000",
+# "8832-201"). Both sides MUST be preserved in the canonical key — different
+# buildings can reuse the same unit numbers, and collapsing them would cause
+# false cross-reference matches with parking system data. Matched separately
+# from _APT_PATTERNS so we can return the building prefix too.
+_BLDG_UNIT_RE = re.compile(r"^(\d+)\s*[-/]\s*(\d+)$")
+
 
 def extract_apt_number(raw) -> Optional[str]:
     """Normalize a raw apartment number to canonical form (digits only, no leading zeros).
@@ -54,6 +61,14 @@ def extract_apt_number(raw) -> Optional[str]:
     # Quick reject: must contain at least one digit
     if not any(c.isdigit() for c in s):
         return None
+    # Building-and-unit composite IDs first (DayRise / similar PMSes).
+    # Returns "<bldg>-<unit>" preserving both sides so different buildings
+    # don't collide on shared unit numbers.
+    m = _BLDG_UNIT_RE.match(upper)
+    if m:
+        bldg = m.group(1).lstrip("0") or "0"
+        unit = m.group(2).lstrip("0") or "0"
+        return f"{bldg}-{unit}"
     for pat in _APT_PATTERNS:
         m = pat.match(upper)
         if m:
